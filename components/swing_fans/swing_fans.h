@@ -17,11 +17,13 @@ namespace swing_fans {
 
 class SwingFansFan;     // Although managed as fan::Fan*, specific type exists
 class SwingFansButton;  // Although managed as button::Button*, specific type exists
+class SwingFansLight;
 
 struct FanConfig {
     std::string name;
     std::string fan_id;
     bool is_24_bit;
+    std::string packet_prefix;
 };
 
 class SwingFansHub : public Component {
@@ -34,11 +36,14 @@ public:
 
     // Stores config data for later use (sending commands)
     void add_fan_config(const std::string &name, const std::string &fan_id, bool is_24_bit);
+    void add_nodip_fan_config(const std::string &name, const std::string &packet_prefix);
     // Stores pointer to the managed fan entity (for receiving commands)
     void add_managed_fan(const std::string &name, fan::Fan *fan_obj);
+    void add_managed_light(SwingFansLight *light_obj) { this->light_entities_.push_back(light_obj); }
 
     // Called by managed Fan/Button entities to trigger RF transmission
     void send_command(const std::string &fan_name, const std::string &command_key);
+    void send_nodip_command(const std::string &fan_name, uint8_t command);
 
     // Public method to be called by the remote_receiver when a code is received
     void process_rc_switch_code(uint64_t code, uint8_t protocol);
@@ -64,6 +69,7 @@ protected:
     std::vector<FanConfig> fan_configs_;                       // Stores config (ID, bitness) per fan name
     std::map<std::string, fan::Fan *> fan_entities_;           // Maps fan name to the managed fan entity pointer
     std::map<std::string, std::string> fan_id_to_name_lookup_; // Maps received fan ID string to fan name
+    std::vector<SwingFansLight *> light_entities_;
 
     Trigger<> *transmit_begin_trigger_ = new Trigger<>();
     Trigger<> *transmit_end_trigger_ = new Trigger<>();
@@ -71,6 +77,8 @@ protected:
     // Internal helper methods
     const FanConfig *get_fan_config_by_name_(const std::string &name);
     const std::string get_command_code_(const FanConfig *config, const std::string &command_key);
+    void transmit_bits_(const std::string &fan_name, const std::string &bits);
+    void apply_received_fan_command_(const std::string &fan_name, const std::string &command);
 };
 
 template <typename... Ts>

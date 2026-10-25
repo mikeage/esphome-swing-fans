@@ -1,5 +1,7 @@
 #include "swing_fans.h"
+#include "swing_fans_light.h"
 #include "esphome/core/log.h"
+#include <cstdlib>
 
 namespace esphome {
 namespace swing_fans {
@@ -38,6 +40,7 @@ void SwingFansHub::setup() {
 
     // Build reverse lookup map from stored configs
     for(const auto& config : this->fan_configs_) {
+        if (!config.packet_prefix.empty()) continue;
         this->fan_id_to_name_lookup_[config.fan_id] = config.name;
     }
     ESP_LOGCONFIG(TAG, "Fan ID lookup map built with %zu entries.", this->fan_id_to_name_lookup_.size());
@@ -48,6 +51,10 @@ void SwingFansHub::dump_config() {
     ESP_LOGCONFIG(TAG, "  Transmitter Linked: %s", YESNO(this->transmitter_ != nullptr));
     ESP_LOGCONFIG(TAG, "  Configured Fans (%zu):", this->fan_configs_.size());
     for (const auto &config : this->fan_configs_) {
+        if (!config.packet_prefix.empty()) {
+            ESP_LOGCONFIG(TAG, "    - Name: %s, No-DIP Packet Prefix: %s", config.name.c_str(), config.packet_prefix.c_str());
+            continue;
+        }
         ESP_LOGCONFIG(TAG, "    - Name: %s, ID: %s, 24-bit: %s",
                       config.name.c_str(), config.fan_id.c_str(), YESNO(config.is_24_bit));
     }
@@ -58,7 +65,12 @@ void SwingFansHub::dump_config() {
 }
 
 void SwingFansHub::add_fan_config(const std::string &name, const std::string &fan_id, bool is_24_bit) {
-    this->fan_configs_.push_back({name, fan_id, is_24_bit});
+    this->fan_configs_.push_back({name, fan_id, is_24_bit, {}});
+}
+
+void SwingFansHub::add_nodip_fan_config(const std::string &name, const std::string &packet_prefix) {
+    this->add_fan_config(name, "", true);
+    this->fan_configs_.back().packet_prefix = packet_prefix;
 }
 
 void SwingFansHub::add_managed_fan(const std::string &name, fan::Fan *fan_obj) {
@@ -104,10 +116,33 @@ void SwingFansHub::send_command(const std::string &fan_name, const std::string &
         return;
     }
 
+    if (!config->packet_prefix.empty()) {
+        // The no-DIP variant shares the original 24-bit command's final byte.
+        const auto suffix = command_code.substr(command_code.size() - 8);
+        this->send_nodip_command(fan_name, static_cast<uint8_t>(~std::strtoul(suffix.c_str(), nullptr, 2)));
+        return;
+    }
+
     std::string bit_string = config->fan_id + command_code;
     ESP_LOGD(TAG, "Sending command for '%s': Key='%s', Bits='%s'",
              fan_name.c_str(), command_key.c_str(), bit_string.c_str());
 
+    this->transmit_bits_(fan_name, bit_string);
+    ESP_LOGD(TAG, "Transmission complete for fan '%s'.", fan_name.c_str());
+}
+
+void SwingFansHub::send_nodip_command(const std::string &fan_name, uint8_t command) {
+    const auto *config = this->get_fan_config_by_name_(fan_name);
+    if (config == nullptr || config->packet_prefix.empty() || this->transmitter_ == nullptr) return;
+    std::string bits = config->packet_prefix + std::bitset<8>(command).to_string();
+    ESP_LOGD(TAG, "Sending RF packet for '%s': packet=%s repeats=%d (RC-Switch bit order)",
+             fan_name.c_str(), bits.c_str(), REPEAT_COUNT);
+    // Convert received bit order to the logical bits used by the pulse encoder.
+    for (char &bit : bits) bit = bit == '0' ? '1' : '0';
+    this->transmit_bits_(fan_name, bits);
+}
+
+void SwingFansHub::transmit_bits_(const std::string &fan_name, const std::string &bit_string) {
     // Construct raw pulse data
     std::vector<long> pulse_list;
     pulse_list.insert(pulse_list.end(), SYNC_PULSES.begin(), SYNC_PULSES.end());
@@ -131,7 +166,6 @@ void SwingFansHub::send_command(const std::string &fan_name, const std::string &
     transmit_call.perform();
 
     this->transmit_end_trigger_->trigger();
-    ESP_LOGD(TAG, "Transmission complete for fan '%s'.", fan_name.c_str());
 }
 
 void SwingFansHub::process_rc_switch_code(uint64_t code, uint8_t protocol) {
@@ -141,6 +175,22 @@ void SwingFansHub::process_rc_switch_code(uint64_t code, uint8_t protocol) {
     }
 
     ESP_LOGV(TAG, "Received RC-Switch Proto %d, Code: %llu", protocol, code);
+
+    for (auto *light_obj : this->light_entities_) {
+        if (light_obj->process_code(code)) return;
+    }
+    for (const auto &config : this->fan_configs_) {
+        if (config.packet_prefix.empty() || code >> 8 != std::strtoul(config.packet_prefix.c_str(), nullptr, 2)) continue;
+        const std::string suffix = std::bitset<8>(~code & 0xFF).to_string();
+        for (const auto &entry : COMMANDS_24BIT) {
+            if (entry.second.compare(entry.second.size() - 8, 8, suffix) == 0) {
+                this->apply_received_fan_command_(config.name, entry.first);
+                return;
+            }
+        }
+        return;
+    }
+    if (this->fan_id_to_name_lookup_.empty()) return;
 
     // Determine code type based on bit length (heuristic)
     bool is_24_bit_code = (code >> 12) > 0;
@@ -228,6 +278,24 @@ void SwingFansHub::process_rc_switch_code(uint64_t code, uint8_t protocol) {
          return;
     }
     call.perform(); // Update the fan component's state
+}
+
+void SwingFansHub::apply_received_fan_command_(const std::string &fan_name, const std::string &command) {
+    auto it = this->fan_entities_.find(fan_name);
+    if (it == this->fan_entities_.end()) return;
+    auto *entity = it->second;
+    bool changed = false;
+    if (command == "off") {
+        changed = entity->state;
+        entity->state = false;
+    } else if (command.compare(0, 6, "speed_") == 0) {
+        const int speed = command.back() - '0';
+        changed = !entity->state || entity->speed != speed;
+        entity->state = true;
+        entity->speed = speed;
+    }
+    // A direction toggle does not report an absolute mode. Publish state without RF echo.
+    if (changed) entity->publish_state();
 }
 
 } // namespace swing_fans

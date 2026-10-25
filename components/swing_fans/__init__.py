@@ -6,7 +6,7 @@ Requires separate remote_transmitter and remote_receiver components.
 """
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import remote_transmitter, fan, button
+from esphome.components import remote_transmitter, fan, button, light
 from esphome.components.fan import RESTORE_MODES
 from esphome.const import (
     CONF_ID,
@@ -17,12 +17,17 @@ from esphome.const import (
     CONF_CODE,
     CONF_PROTOCOL,
     CONF_TRIGGER_ID,
+    CONF_LIGHT,
+    CONF_OUTPUT_ID,
+    CONF_GAMMA_CORRECT,
+    CONF_DEFAULT_TRANSITION_LENGTH,
 )
 from esphome import automation
 from esphome.core import coroutine_with_priority
 
 CODEOWNERS = ["@robertos"]
 DEPENDENCIES = ["remote_transmitter", "remote_receiver", "fan", "button"]
+AUTO_LOAD = ["light"]
 
 # Indicates that this directory contains multiple related C++ classes/files
 MULTI_CONF = True
@@ -32,6 +37,7 @@ swing_fans_ns = cg.esphome_ns.namespace("swing_fans")
 SwingFansHub = swing_fans_ns.class_("SwingFansHub", cg.Component)
 SwingFansFan = swing_fans_ns.class_("SwingFansFan", fan.Fan, cg.Component)
 SwingFansButton = swing_fans_ns.class_("SwingFansButton", button.Button, cg.Component)
+SwingFansLight = swing_fans_ns.class_("SwingFansLight", light.LightOutput)
 ReceivedCodeAction = swing_fans_ns.class_("ReceivedCodeAction", automation.Action)
 
 # Custom configuration keys
@@ -44,18 +50,52 @@ CONF_REMOTE_TRANSMITTER_ID = "remote_transmitter_id"
 CONF_ON_TRANSMIT_BEGIN = "on_transmit_begin"
 CONF_ON_TRANSMIT_END = "on_transmit_end"
 CONF_HUB_ID = "hub_id" # Key for linking action to hub
+CONF_IS_24_BIT_NODIP = "is_24_bit_nodip"
+CONF_PACKET_PREFIX = "packet_prefix"
+
+LIGHT_SCHEMA = light.light_schema(
+    SwingFansLight, light.LightType.BRIGHTNESS_ONLY,
+    default_restore_mode="RESTORE_DEFAULT_OFF",
+).extend({
+    cv.Optional(CONF_GAMMA_CORRECT, default=1.0): cv.positive_float,
+    cv.Optional(CONF_DEFAULT_TRANSITION_LENGTH, default="0s"): cv.positive_time_period_milliseconds,
+})
+
+
+def validate_packet_prefix(value):
+    value = cv.string_strict(value)
+    if len(value) != 16 or any(bit not in "01" for bit in value):
+        raise cv.Invalid("packet_prefix must be a quoted 16-bit binary string")
+    return value
+
+
+def validate_fan(config):
+    if config[CONF_IS_24_BIT_NODIP]:
+        if config[CONF_IS_24_BIT] or CONF_FAN_ID in config:
+            raise cv.Invalid("Use packet_prefix instead of fan_id/is_24_bit for the no-DIP mode")
+        if CONF_PACKET_PREFIX not in config:
+            raise cv.Invalid("packet_prefix is required for the no-DIP mode")
+    else:
+        if CONF_FAN_ID not in config:
+            raise cv.Invalid("fan_id is required for the original protocol")
+        if CONF_PACKET_PREFIX in config or CONF_LIGHT in config:
+            raise cv.Invalid("packet_prefix and light require is_24_bit_nodip: true")
+    return config
 
 # Schema for an individual fan entry under the hub
-FAN_SCHEMA = cv.Schema(
+FAN_SCHEMA = cv.All(cv.Schema(
     {
         cv.Required(CONF_NAME): cv.string, # Used for Fan entity name
-        cv.Required(CONF_FAN_ID): cv.string,
+        cv.Optional(CONF_FAN_ID): cv.string,
         cv.Optional(CONF_IS_24_BIT, default=False): cv.boolean,
+        cv.Optional(CONF_IS_24_BIT_NODIP, default=False): cv.boolean,
+        cv.Optional(CONF_PACKET_PREFIX): validate_packet_prefix,
+        cv.Optional(CONF_LIGHT): LIGHT_SCHEMA,
         cv.Optional(CONF_DIRECTION_BUTTON_ICON, default="mdi:swap-horizontal"): cv.icon,
         cv.Optional(CONF_DIRECTION_BUTTON_NAME): cv.string, # Defaults to "<Fan Name> Direction"
         cv.Optional(CONF_RESTORE_MODE, default="RESTORE_DEFAULT_OFF"): cv.enum(RESTORE_MODES, upper=True, space="_"),
     }
-)
+), validate_fan)
 
 # Main hub configuration schema
 CONFIG_SCHEMA = cv.Schema(
@@ -109,7 +149,10 @@ async def to_code(config):
         fan_name = fan_conf[CONF_NAME]
 
         # Store fan config details in the hub C++ object
-        cg.add(hub.add_fan_config(fan_name, fan_conf[CONF_FAN_ID], fan_conf[CONF_IS_24_BIT]))
+        if fan_conf[CONF_IS_24_BIT_NODIP]:
+            cg.add(hub.add_nodip_fan_config(fan_name, fan_conf[CONF_PACKET_PREFIX]))
+        else:
+            cg.add(hub.add_fan_config(fan_name, fan_conf[CONF_FAN_ID], fan_conf[CONF_IS_24_BIT]))
 
         # Create Fan Entity
         fan_id_obj = cv.declare_id(SwingFansFan)(f"{config[CONF_ID]}_fan_{i}")
@@ -134,3 +177,12 @@ async def to_code(config):
              CONF_DISABLED_BY_DEFAULT: False,
         })
         cg.add(button_var.set_hub(hub))
+
+        # Create the optional six-level light for no-DIP remotes.
+        if CONF_LIGHT in fan_conf:
+            light_conf = fan_conf[CONF_LIGHT]
+            light_var = cg.new_Pvariable(
+                light_conf[CONF_OUTPUT_ID], hub, fan_name, fan_conf[CONF_PACKET_PREFIX]
+            )
+            await light.register_light(light_var, light_conf)
+            cg.add(hub.add_managed_light(light_var))
