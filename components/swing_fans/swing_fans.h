@@ -81,7 +81,7 @@ class ReceivedCodeAction : public Action<Ts...> {
   TEMPLATABLE_VALUE(uint64_t, code)
   TEMPLATABLE_VALUE(uint8_t, protocol)
 
-  void play(Ts... x) override {
+  void play(const Ts &...x) override {
     this->hub_->process_rc_switch_code(
         this->code_.value(x...),
         this->protocol_.value(x...)
